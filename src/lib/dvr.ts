@@ -9,9 +9,7 @@ export type SimpleMatch = {
 export type TeamDvrResult = {
   teamKey: string;
   teamNumber: number;
-  opr: number;
   dvr: number;
-  dpr: number;
   dvrRank: number;
 };
 
@@ -21,12 +19,13 @@ type Observation = {
   defendingAlliance: string[];
 };
 
-type RidgeFit = {
-  coefficients: number[];
-  predictions: number[];
+type IndexedObservation = {
+  score: number;
+  scoring: number[];
+  defending: number[];
 };
 
-const LAMBDA_GRID = [0.01, 0.1, 0.3, 1, 3, 10, 30, 100];
+const DEFAULT_LAMBDA = 1;
 
 function teamNumberFromKey(teamKey: string): number {
   const numericPart = teamKey.replace("frc", "");
@@ -34,19 +33,14 @@ function teamNumberFromKey(teamKey: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function dot(a: number[], b: number[]): number {
-  let total = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    total += a[i] * b[i];
-  }
-  return total;
-}
-
-function buildObservations(matches: SimpleMatch[]): Observation[] {
+function buildObservations(
+  matches: SimpleMatch[],
+  includeOnlyQualification: boolean
+): Observation[] {
   const observations: Observation[] = [];
 
   for (const match of matches) {
-    if (match.comp_level !== "qm") {
+    if (includeOnlyQualification && match.comp_level !== "qm") {
       continue;
     }
 
@@ -75,197 +69,99 @@ function buildObservations(matches: SimpleMatch[]): Observation[] {
   return observations;
 }
 
-function buildFeatureRows(
+function buildIndexedObservations(
   observations: Observation[],
-  teams: string[],
   teamIndex: Map<string, number>
-): { x: number[][]; y: number[] } {
-  const featureCount = 1 + 2 * teams.length;
-  const x: number[][] = [];
-  const y: number[] = [];
-
-  for (const obs of observations) {
-    const row = new Array<number>(featureCount).fill(0);
-    row[0] = 1; // Intercept
-
-    for (const team of obs.scoringAlliance) {
-      const idx = teamIndex.get(team);
-      if (idx !== undefined) {
-        row[1 + idx] += 1;
-      }
-    }
-
-    for (const team of obs.defendingAlliance) {
-      const idx = teamIndex.get(team);
-      if (idx !== undefined) {
-        row[1 + teams.length + idx] -= 1;
-      }
-    }
-
-    x.push(row);
-    y.push(obs.score);
-  }
-
-  return { x, y };
+): IndexedObservation[] {
+  return observations.map((obs) => ({
+    score: obs.score,
+    scoring: obs.scoringAlliance
+      .map((team) => teamIndex.get(team))
+      .filter((idx): idx is number => idx !== undefined),
+    defending: obs.defendingAlliance
+      .map((team) => teamIndex.get(team))
+      .filter((idx): idx is number => idx !== undefined),
+  }));
 }
 
-function solveLinearSystem(a: number[][], b: number[]): number[] {
-  const n = a.length;
-  const aug = a.map((row, i) => [...row, b[i]]);
-
-  for (let col = 0; col < n; col += 1) {
-    let pivot = col;
-    for (let row = col + 1; row < n; row += 1) {
-      if (Math.abs(aug[row][col]) > Math.abs(aug[pivot][col])) {
-        pivot = row;
-      }
-    }
-
-    if (Math.abs(aug[pivot][col]) < 1e-9) {
-      continue;
-    }
-
-    if (pivot !== col) {
-      [aug[col], aug[pivot]] = [aug[pivot], aug[col]];
-    }
-
-    const pivotValue = aug[col][col];
-    for (let j = col; j <= n; j += 1) {
-      aug[col][j] /= pivotValue;
-    }
-
-    for (let row = 0; row < n; row += 1) {
-      if (row === col) {
-        continue;
-      }
-      const factor = aug[row][col];
-      if (factor === 0) {
-        continue;
-      }
-      for (let j = col; j <= n; j += 1) {
-        aug[row][j] -= factor * aug[col][j];
-      }
-    }
+function predictObservation(
+  obs: IndexedObservation,
+  intercept: number,
+  offense: Float64Array,
+  defense: Float64Array
+): number {
+  let value = intercept;
+  for (const idx of obs.scoring) {
+    value += offense[idx];
   }
-
-  return aug.map((row) => row[n]);
+  for (const idx of obs.defending) {
+    value -= defense[idx];
+  }
+  return value;
 }
 
-function fitRidge(x: number[][], y: number[], lambda: number): RidgeFit {
-  const featureCount = x[0]?.length ?? 0;
-  const xtx = Array.from({ length: featureCount }, () =>
-    new Array<number>(featureCount).fill(0)
-  );
-  const xty = new Array<number>(featureCount).fill(0);
+function fitRidgeSparse(
+  observations: IndexedObservation[],
+  teamCount: number,
+  lambda: number
+): { intercept: number; offense: Float64Array; defense: Float64Array } {
+  const offense = new Float64Array(teamCount);
+  const defense = new Float64Array(teamCount);
+  const gradientsOffense = new Float64Array(teamCount);
+  const gradientsDefense = new Float64Array(teamCount);
 
-  for (let rowIndex = 0; rowIndex < x.length; rowIndex += 1) {
-    const row = x[rowIndex];
-    const target = y[rowIndex];
+  const rowCount = observations.length;
+  const rowScale = 2 / Math.max(rowCount, 1);
 
-    for (let i = 0; i < featureCount; i += 1) {
-      xty[i] += row[i] * target;
-      for (let j = 0; j < featureCount; j += 1) {
-        xtx[i][j] += row[i] * row[j];
+  let intercept = 0;
+  let learningRate = rowCount > 100_000 ? 0.03 : 0.06;
+  const epochs = rowCount > 100_000 ? 12 : rowCount > 30_000 ? 16 : 24;
+
+  for (let epoch = 0; epoch < epochs; epoch += 1) {
+    gradientsOffense.fill(0);
+    gradientsDefense.fill(0);
+    let gradIntercept = 0;
+
+    for (const obs of observations) {
+      const prediction = predictObservation(obs, intercept, offense, defense);
+      const error = prediction - obs.score;
+      gradIntercept += error;
+      for (const idx of obs.scoring) {
+        gradientsOffense[idx] += error;
+      }
+      for (const idx of obs.defending) {
+        gradientsDefense[idx] -= error;
       }
     }
-  }
 
-  for (let i = 1; i < featureCount; i += 1) {
-    xtx[i][i] += lambda;
-  }
+    intercept -= learningRate * rowScale * gradIntercept;
 
-  const coefficients = solveLinearSystem(xtx, xty);
-  const predictions = x.map((row) => dot(row, coefficients));
-  return { coefficients, predictions };
-}
-
-function seededShuffle<T>(values: T[]): T[] {
-  const shuffled = [...values];
-  let seed = 123456789;
-
-  for (let i = shuffled.length - 1; i > 0; i -= 1) {
-    seed = (1103515245 * seed + 12345) % 2147483648;
-    const j = seed % (i + 1);
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
-
-  return shuffled;
-}
-
-function mse(actual: number[], predicted: number[]): number {
-  if (actual.length === 0) {
-    return Number.POSITIVE_INFINITY;
-  }
-
-  let total = 0;
-  for (let i = 0; i < actual.length; i += 1) {
-    const error = actual[i] - predicted[i];
-    total += error * error;
-  }
-  return total / actual.length;
-}
-
-function pickBestLambda(x: number[][], y: number[]): number {
-  if (x.length < 10) {
-    return 1;
-  }
-
-  const indices = seededShuffle(Array.from({ length: x.length }, (_, i) => i));
-  const folds = Math.min(5, x.length);
-  const foldBuckets: number[][] = Array.from({ length: folds }, () => []);
-  for (let i = 0; i < indices.length; i += 1) {
-    foldBuckets[i % folds].push(indices[i]);
-  }
-
-  let bestLambda = LAMBDA_GRID[0];
-  let bestScore = Number.POSITIVE_INFINITY;
-
-  for (const lambda of LAMBDA_GRID) {
-    let foldError = 0;
-
-    for (const validationIdx of foldBuckets) {
-      const trainMask = new Set(validationIdx);
-      const trainX: number[][] = [];
-      const trainY: number[] = [];
-      const valX: number[][] = [];
-      const valY: number[] = [];
-
-      for (let i = 0; i < x.length; i += 1) {
-        if (trainMask.has(i)) {
-          valX.push(x[i]);
-          valY.push(y[i]);
-        } else {
-          trainX.push(x[i]);
-          trainY.push(y[i]);
-        }
-      }
-
-      if (trainX.length === 0 || valX.length === 0) {
-        continue;
-      }
-
-      const fit = fitRidge(trainX, trainY, lambda);
-      const predicted = valX.map((row) => dot(row, fit.coefficients));
-      foldError += mse(valY, predicted);
+    for (let teamIdx = 0; teamIdx < teamCount; teamIdx += 1) {
+      const offGrad =
+        rowScale * gradientsOffense[teamIdx] + (2 * lambda * offense[teamIdx]) / rowCount;
+      const defGrad =
+        rowScale * gradientsDefense[teamIdx] + (2 * lambda * defense[teamIdx]) / rowCount;
+      offense[teamIdx] -= learningRate * offGrad;
+      defense[teamIdx] -= learningRate * defGrad;
     }
 
-    const avgError = foldError / folds;
-    if (avgError < bestScore) {
-      bestScore = avgError;
-      bestLambda = lambda;
-    }
+    learningRate *= 0.9;
   }
 
-  return bestLambda;
+  return { intercept, offense, defense };
 }
 
-export function calculateDvr(matches: SimpleMatch[]): {
+export function calculateDvr(
+  matches: SimpleMatch[],
+  options?: { includeOnlyQualification?: boolean }
+): {
   lambda: number;
   observations: number;
   teams: number;
   results: TeamDvrResult[];
 } {
-  const observations = buildObservations(matches);
+  const includeOnlyQualification = options?.includeOnlyQualification ?? true;
+  const observations = buildObservations(matches, includeOnlyQualification);
   const teamSet = new Set<string>();
 
   for (const obs of observations) {
@@ -295,27 +191,20 @@ export function calculateDvr(matches: SimpleMatch[]): {
     teamIndex.set(team, idx);
   });
 
-  const { x, y } = buildFeatureRows(observations, teams, teamIndex);
-  const lambda = pickBestLambda(x, y);
-  const fit = fitRidge(x, y, lambda);
+  const indexedObservations = buildIndexedObservations(observations, teamIndex);
+  const lambda = DEFAULT_LAMBDA;
+  const fit = fitRidgeSparse(indexedObservations, teams.length, lambda);
 
-  const offensiveOffset = 1;
-  const defensiveOffset = 1 + teams.length;
-  const rawDefense = teams.map(
-    (_, idx) => fit.coefficients[defensiveOffset + idx] ?? 0
-  );
+  const rawDefense = teams.map((_, idx) => fit.defense[idx] ?? 0);
   const defenseMean =
     rawDefense.reduce((sum, value) => sum + value, 0) / rawDefense.length;
 
   const results = teams.map((team, idx) => {
-    const opr = fit.coefficients[offensiveOffset + idx] ?? 0;
     const dvr = rawDefense[idx] - defenseMean;
     return {
       teamKey: team,
       teamNumber: teamNumberFromKey(team),
-      opr,
       dvr,
-      dpr: -dvr,
       dvrRank: 0,
     };
   });

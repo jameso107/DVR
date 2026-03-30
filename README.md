@@ -1,12 +1,11 @@
 # FRC DVR Dashboard
 
 Simple Next.js app that pulls match data from The Blue Alliance and calculates
-Defensive Value Rating (DVR) for an event in near real time.
+Defensive Value Rating (DVR) for a worldwide yearly leaderboard.
 
 ## DVR model in this app
 
-Per completed qualification match, the app creates two alliance-score
-observations and fits:
+Per completed match, the app creates two alliance-score observations and fits:
 
 `y = alpha + sum(O_i over scoring alliance) - sum(G_j over defending alliance) + error`
 
@@ -23,6 +22,12 @@ observations and fits:
 2. Run:
    - `npm run dev`
 3. Open [http://localhost:3000](http://localhost:3000)
+
+## Usage
+
+- Choose a year.
+- Click `Manual refresh` to recompute the global leaderboard from all matches
+  in all events for that year.
 
 ## Vercel deployment
 

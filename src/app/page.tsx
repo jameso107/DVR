@@ -1,14 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-
-type EventOption = {
-  key: string;
-  name: string;
-  code: string;
-  type: string;
-  startDate: string;
-};
+import { useCallback, useEffect, useState } from "react";
 
 type DvrResult = {
   teamKey: string;
@@ -18,11 +10,14 @@ type DvrResult = {
 };
 
 type DvrResponse = {
-  eventKey: string;
+  year: number;
+  events: number;
+  matches: number;
   lambda: number;
   observations: number;
   teams: number;
   results: DvrResult[];
+  cached?: boolean;
 };
 
 const CURRENT_YEAR = new Date().getFullYear();
@@ -33,97 +28,48 @@ function formatMetric(value: number): string {
 
 export default function Home() {
   const [year, setYear] = useState<number>(CURRENT_YEAR);
-  const [events, setEvents] = useState<EventOption[]>([]);
-  const [selectedEvent, setSelectedEvent] = useState<string>("");
   const [dvrData, setDvrData] = useState<DvrResponse | null>(null);
-  const [loadingEvents, setLoadingEvents] = useState(false);
   const [loadingDvr, setLoadingDvr] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const selectedEventMeta = useMemo(
-    () => events.find((event) => event.key === selectedEvent),
-    [events, selectedEvent]
-  );
-
-  const loadEvents = useCallback(async () => {
-    setLoadingEvents(true);
-    setError(null);
-
-    try {
-      const response = await fetch(`/api/tba/events?year=${year}`);
-      const data = (await response.json()) as {
-        events?: EventOption[];
-        error?: string;
-      };
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Failed to load events.");
-      }
-
-      const nextEvents = data.events ?? [];
-      setEvents(nextEvents);
-      setSelectedEvent((current) => {
-        if (current && nextEvents.some((event) => event.key === current)) {
-          return current;
-        }
-        return nextEvents[0]?.key ?? "";
-      });
-    } catch (err) {
-      setEvents([]);
-      setSelectedEvent("");
-      setDvrData(null);
-      setError(err instanceof Error ? err.message : "Unknown events error.");
-    } finally {
-      setLoadingEvents(false);
-    }
-  }, [year]);
-
-  const loadDvr = useCallback(async (eventKey: string) => {
-    if (!eventKey) {
-      return;
-    }
+  const loadDvr = useCallback(async (forceRefresh = false) => {
     setLoadingDvr(true);
     setError(null);
 
     try {
-      const response = await fetch(`/api/tba/event/${eventKey}/dvr`);
+      const params = new URLSearchParams();
+      if (forceRefresh) {
+        params.set("refresh", "1");
+      }
+      const query = params.toString();
+      const response = await fetch(`/api/tba/year/${year}/dvr${query ? `?${query}` : ""}`, {
+        cache: "no-store",
+      });
       const data = (await response.json()) as DvrResponse & { error?: string };
       if (!response.ok) {
-        throw new Error(data.error ?? "Failed to load DVR.");
+        throw new Error(data.error ?? "Failed to load worldwide DVR.");
       }
       setDvrData(data);
     } catch (err) {
       setDvrData(null);
-      setError(err instanceof Error ? err.message : "Unknown DVR error.");
+      setError(err instanceof Error ? err.message : "Unknown worldwide DVR error.");
     } finally {
       setLoadingDvr(false);
     }
-  }, []);
+  }, [year]);
 
   useEffect(() => {
-    loadEvents();
-  }, [loadEvents]);
-
-  useEffect(() => {
-    if (!selectedEvent) {
-      return;
-    }
-
-    loadDvr(selectedEvent);
-    const timer = setInterval(() => {
-      loadDvr(selectedEvent);
-    }, 30_000);
-    return () => clearInterval(timer);
-  }, [selectedEvent, loadDvr]);
+    loadDvr(false);
+  }, [loadDvr]);
 
   return (
     <main className="page">
       <section className="card">
-        <h1>FRC DVR Live Dashboard</h1>
+        <h1>FRC Worldwide DVR Leaderboard</h1>
         <p className="subtle">
           Defensive Value Rating (DVR) uses a joint offense-defense ridge model
-          on qualification match scores and updates automatically every 30
-          seconds for the selected event.
+          on all completed matches in the selected year, aggregated across all
+          events.
         </p>
 
         <div className="controls">
@@ -136,53 +82,27 @@ export default function Home() {
               onChange={(event) => setYear(Number(event.target.value))}
             />
           </label>
-          <button type="button" onClick={loadEvents} disabled={loadingEvents}>
-            {loadingEvents ? "Loading events..." : "Load events"}
-          </button>
-        </div>
-
-        <div className="controls">
-          <label className="full-width">
-            Event
-            <select
-              value={selectedEvent}
-              onChange={(event) => setSelectedEvent(event.target.value)}
-              disabled={loadingEvents || events.length === 0}
-            >
-              {events.length === 0 ? (
-                <option value="">No events found</option>
-              ) : (
-                events.map((event) => (
-                  <option key={event.key} value={event.key}>
-                    {event.name} ({event.key})
-                  </option>
-                ))
-              )}
-            </select>
-          </label>
           <button
             type="button"
-            onClick={() => loadDvr(selectedEvent)}
-            disabled={!selectedEvent || loadingDvr}
+            onClick={() => loadDvr(true)}
+            disabled={loadingDvr}
           >
-            {loadingDvr ? "Refreshing..." : "Refresh now"}
+            {loadingDvr ? "Refreshing..." : "Manual refresh"}
           </button>
         </div>
-
-        {selectedEventMeta ? (
-          <p className="subtle">
-            {selectedEventMeta.type} | starts {selectedEventMeta.startDate}
-          </p>
-        ) : null}
 
         {error ? <p className="error">{error}</p> : null}
 
         {dvrData ? (
           <>
             <div className="metrics">
+              <span>year: {dvrData.year}</span>
+              <span>events: {dvrData.events}</span>
+              <span>matches: {dvrData.matches}</span>
               <span>lambda: {dvrData.lambda}</span>
               <span>observations: {dvrData.observations}</span>
               <span>teams: {dvrData.teams}</span>
+              <span>cache: {dvrData.cached ? "hit" : "recomputed"}</span>
             </div>
 
             <div className="table-wrap">
@@ -200,7 +120,7 @@ export default function Home() {
                       <td>{team.dvrRank}</td>
                       <td>
                         <a
-                          href={`https://www.thebluealliance.com/team/${team.teamNumber}/2026`}
+                          href={`https://www.thebluealliance.com/team/${team.teamNumber}/${year}`}
                           target="_blank"
                           rel="noopener noreferrer"
                         >
@@ -217,8 +137,8 @@ export default function Home() {
         ) : (
           <p className="subtle">
             {loadingDvr
-              ? "Calculating DVR from TBA match data..."
-              : "Select an event to calculate DVR."}
+              ? "Calculating worldwide DVR from all TBA match data..."
+              : "Click Manual refresh to calculate the worldwide leaderboard."}
           </p>
         )}
       </section>
